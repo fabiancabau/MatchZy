@@ -394,6 +394,7 @@ namespace MatchZy
                 isDryRun = false;
                 isVeto = false;
                 isPreVeto = false;
+                Interlocked.Exchange(ref _matchEndGuard, 0);
 
                 lastBackupFileName = "";
                 lastMatchZyBackupFileName = "";
@@ -839,128 +840,139 @@ namespace MatchZy
 
         private void HandleMatchEnd()
         {
-            if (!isMatchLive) return;
+            if (!isMatchLive || Interlocked.CompareExchange(ref _matchEndGuard, 1, 0) != 0) return;
+            _ = HandleMatchEndAsync();
+        }
 
-            // This ensures that the mp_match_restart_delay is not shorter than what is required for the GOTV recording to finish.
-            // Ref: Get5
-            int restartDelay = ConVar.Find("mp_match_restart_delay")!.GetPrimitiveValue<int>();
-            int tvDelay = GetTvDelay();
-            int requiredDelay = tvDelay + 15;
-            int tvFlushDelay = requiredDelay;
-            if (tvDelay > 0.0)
+        private async Task HandleMatchEndAsync()
+        {
+            try
             {
-                requiredDelay += 10;
-            }
-            if (requiredDelay > restartDelay)
-            {
-                Log($"Extended mp_match_restart_delay from {restartDelay} to {requiredDelay} to ensure GOTV broadcast can finish.");
-                ConVar.Find("mp_match_restart_delay")!.SetValue(requiredDelay);
-                restartDelay = requiredDelay;
-            }
-            int currentMapNumber = matchConfig.CurrentMapNumber;
-            Log($"[HandleMatchEnd] MAP ENDED, isMatchSetup: {isMatchSetup} matchid: {liveMatchId} currentMapNumber: {currentMapNumber} tvFlushDelay: {tvFlushDelay}");
+                // This ensures that the mp_match_restart_delay is not shorter than what is required for the GOTV recording to finish.
+                // Ref: Get5
+                int restartDelay = ConVar.Find("mp_match_restart_delay")!.GetPrimitiveValue<int>();
+                int tvDelay = GetTvDelay();
+                int requiredDelay = tvDelay + 15;
+                int tvFlushDelay = requiredDelay;
+                if (tvDelay > 0.0)
+                {
+                    requiredDelay += 10;
+                }
+                if (requiredDelay > restartDelay)
+                {
+                    Log($"Extended mp_match_restart_delay from {restartDelay} to {requiredDelay} to ensure GOTV broadcast can finish.");
+                    ConVar.Find("mp_match_restart_delay")!.SetValue(requiredDelay);
+                    restartDelay = requiredDelay;
+                }
 
-            StopDemoRecording(tvFlushDelay - 0.5f, activeDemoFile, liveMatchId, currentMapNumber);
+                int currentMapNumber = matchConfig.CurrentMapNumber;
+                long matchId = liveMatchId;
 
-            string winnerName = GetMatchWinnerName();
-            (int t1score, int t2score) = GetTeamsScore();
-            int team1SeriesScore = matchzyTeam1.seriesScore;
-            int team2SeriesScore = matchzyTeam2.seriesScore;
+                Log($"[HandleMatchEnd] MAP ENDED, isMatchSetup: {isMatchSetup} matchid: {matchId} currentMapNumber: {currentMapNumber} tvFlushDelay: {tvFlushDelay}");
 
-            string statsPath = Server.GameDirectory + "/csgo/MatchZy_Stats/" + liveMatchId.ToString();
+                StopDemoRecording(tvFlushDelay - 0.5f, activeDemoFile, matchId, currentMapNumber);
 
-            var mapResultEvent = new MapResultEvent
-            {
-                MatchId = liveMatchId,
-                MapNumber = currentMapNumber,
-                Winner = new Winner(t1score > t2score && reverseTeamSides["CT"] == matchzyTeam1 ? "3" : "2", t1score > t2score ? "team1" : "team2"),
-                StatsTeam1 = new MatchZyStatsTeam(matchzyTeam1.id, matchzyTeam1.teamName, team1SeriesScore, t1score, 0, 0, new List<StatsPlayer>()),
-                StatsTeam2 = new MatchZyStatsTeam(matchzyTeam2.id, matchzyTeam2.teamName, team2SeriesScore, t2score, 0, 0, new List<StatsPlayer>())
-            };
+                string winnerName = GetMatchWinnerName();
+                (int t1score, int t2score) = GetTeamsScore();
+                int team1SeriesScore = matchzyTeam1.seriesScore;
+                int team2SeriesScore = matchzyTeam2.seriesScore;
 
-            Task.Run(async () =>
-            {
+                string statsPath = Server.GameDirectory + "/csgo/MatchZy_Stats/" + matchId.ToString();
+
+                var mapResultEvent = new MapResultEvent
+                {
+                    MatchId = matchId,
+                    MapNumber = currentMapNumber,
+                    Winner = new Winner(t1score > t2score && reverseTeamSides["CT"] == matchzyTeam1 ? "3" : "2", t1score > t2score ? "team1" : "team2"),
+                    StatsTeam1 = new MatchZyStatsTeam(matchzyTeam1.id, matchzyTeam1.teamName, team1SeriesScore, t1score, 0, 0, new List<StatsPlayer>()),
+                    StatsTeam2 = new MatchZyStatsTeam(matchzyTeam2.id, matchzyTeam2.teamName, team2SeriesScore, t2score, 0, 0, new List<StatsPlayer>())
+                };
+
                 await SendEventAsync(mapResultEvent);
-                await database.SetMapEndData(liveMatchId, currentMapNumber, winnerName, t1score, t2score, team1SeriesScore, team2SeriesScore);
-                await database.WritePlayerStatsToCsv(statsPath, liveMatchId, currentMapNumber);
-            });
+                await database.SetMapEndData(matchId, currentMapNumber, winnerName, t1score, t2score, team1SeriesScore, team2SeriesScore);
+                await database.WritePlayerStatsToCsv(statsPath, matchId, currentMapNumber);
 
-            // If a match is not setup, it was supposed to be a pug/scrim with 1 map
-            // Hence we reset the match once it is over
-            // Todo: Support BO3/BO5 in pugs as well
-            if (!isMatchSetup)
-            {
-                EndSeries(winnerName, restartDelay - 1, t1score, t2score);
-                return;
-            }
-
-            int remainingMaps = matchConfig.NumMaps - matchzyTeam1.seriesScore - matchzyTeam2.seriesScore;
-            Log($"[HandleMatchEnd] MATCH ENDED, remainingMaps: {remainingMaps}, NumMaps: {matchConfig.NumMaps}, Team1SeriesScore: {matchzyTeam1.seriesScore}, Team2SeriesScore: {matchzyTeam2.seriesScore}");
-            if (matchzyTeam1.seriesScore == matchzyTeam2.seriesScore && remainingMaps <= 0)
-            {
-                EndSeries(null, restartDelay - 1, t1score, t2score);
-            }
-            else if (matchConfig.SeriesCanClinch)
-            {
-                int mapsToWinSeries = (matchConfig.NumMaps / 2) + 1;
-                if (matchzyTeam1.seriesScore == mapsToWinSeries)
+                // If a match is not setup, it was supposed to be a pug/scrim with 1 map
+                // Hence we reset the match once it is over
+                // Todo: Support BO3/BO5 in pugs as well
+                if (!isMatchSetup)
                 {
-                    EndSeries(winnerName, restartDelay - 1, t1score, t2score);
+                    await EndSeriesAsync(winnerName, restartDelay - 1, t1score, t2score);
                     return;
                 }
-                else if (matchzyTeam2.seriesScore == mapsToWinSeries)
+
+                int remainingMaps = matchConfig.NumMaps - matchzyTeam1.seriesScore - matchzyTeam2.seriesScore;
+                Log($"[HandleMatchEnd] MATCH ENDED, remainingMaps: {remainingMaps}, NumMaps: {matchConfig.NumMaps}, Team1SeriesScore: {matchzyTeam1.seriesScore}, Team2SeriesScore: {matchzyTeam2.seriesScore}");
+                if (matchzyTeam1.seriesScore == matchzyTeam2.seriesScore && remainingMaps <= 0)
                 {
-                    EndSeries(winnerName, restartDelay - 1, t1score, t2score);
+                    await EndSeriesAsync(null, restartDelay - 1, t1score, t2score);
                     return;
                 }
+                else if (matchConfig.SeriesCanClinch)
+                {
+                    int mapsToWinSeries = (matchConfig.NumMaps / 2) + 1;
+                    if (matchzyTeam1.seriesScore == mapsToWinSeries || matchzyTeam2.seriesScore == mapsToWinSeries)
+                    {
+                        await EndSeriesAsync(winnerName, restartDelay - 1, t1score, t2score);
+                        return;
+                    }
+                }
+                else if (remainingMaps <= 0)
+                {
+                    await EndSeriesAsync(winnerName, restartDelay - 1, t1score, t2score);
+                    return;
+                }
+
+                if (matchzyTeam1.seriesScore > matchzyTeam2.seriesScore)
+                {
+                    Server.PrintToChatAll($"{chatPrefix} {ChatColors.Green}{matchzyTeam1.teamName}{ChatColors.Default} is winning the series {ChatColors.Green}{matchzyTeam1.seriesScore}-{matchzyTeam2.seriesScore}{ChatColors.Default}");
+                }
+                else if (matchzyTeam2.seriesScore > matchzyTeam1.seriesScore)
+                {
+                    Server.PrintToChatAll($"{chatPrefix} {ChatColors.Green}{matchzyTeam2.teamName}{ChatColors.Default} is winning the series {ChatColors.Green}{matchzyTeam2.seriesScore}-{matchzyTeam1.seriesScore}{ChatColors.Default}");
+                }
+                else
+                {
+                    Server.PrintToChatAll($"{chatPrefix} The series is tied at {ChatColors.Green}{matchzyTeam1.seriesScore}-{matchzyTeam2.seriesScore}{ChatColors.Default}");
+                }
+
+                matchConfig.CurrentMapNumber += 1;
+                string nextMap = matchConfig.Maplist[matchConfig.CurrentMapNumber];
+
+                if (isPaused)
+                    UnpauseMatch();
+
+                stopData["ct"] = false;
+                stopData["t"] = false;
+
+                KillPhaseTimers();
+
+                AddTimer(restartDelay - 4, () =>
+                {
+                    if (!isMatchSetup) return;
+                    ChangeMap(nextMap, 3.0f);
+                    matchStarted = false;
+                    readyAvailable = true;
+                    isPaused = false;
+
+                    isWarmup = true;
+                    isKnifeRound = false;
+                    isSideSelectionPhase = false;
+                    isMatchLive = false;
+                    isPractice = false;
+                    isDryRun = false;
+                    StartWarmup();
+                    SetMapSides();
+                });
             }
-            else if (remainingMaps <= 0)
+            catch (Exception ex)
             {
-                EndSeries(winnerName, restartDelay - 1, t1score, t2score);
-                return;
+                Log($"[HandleMatchEndAsync - FATAL] [ERROR]: {ex.Message}");
             }
-            if (matchzyTeam1.seriesScore > matchzyTeam2.seriesScore)
+            finally
             {
-                Server.PrintToChatAll($"{chatPrefix} {ChatColors.Green}{matchzyTeam1.teamName}{ChatColors.Default} is winning the series {ChatColors.Green}{matchzyTeam1.seriesScore}-{matchzyTeam2.seriesScore}{ChatColors.Default}");
-
+                Interlocked.Exchange(ref _matchEndGuard, 0);
             }
-            else if (matchzyTeam2.seriesScore > matchzyTeam1.seriesScore)
-            {
-                Server.PrintToChatAll($"{chatPrefix} {ChatColors.Green}{matchzyTeam2.teamName}{ChatColors.Default} is winning the series {ChatColors.Green}{matchzyTeam2.seriesScore}-{matchzyTeam1.seriesScore}{ChatColors.Default}");
-
-            }
-            else
-            {
-                Server.PrintToChatAll($"{chatPrefix} The series is tied at {ChatColors.Green}{matchzyTeam1.seriesScore}-{matchzyTeam2.seriesScore}{ChatColors.Default}");
-            }
-            matchConfig.CurrentMapNumber += 1;
-            string nextMap = matchConfig.Maplist[matchConfig.CurrentMapNumber];
-
-            if (isPaused)
-                UnpauseMatch();
-
-            stopData["ct"] = false;
-            stopData["t"] = false;
-
-            KillPhaseTimers();
-
-            AddTimer(restartDelay - 4, () =>
-            {
-                if (!isMatchSetup) return;
-                ChangeMap(nextMap, 3.0f);
-                matchStarted = false;
-                readyAvailable = true;
-                isPaused = false;
-
-                isWarmup = true;
-                isKnifeRound = false;
-                isSideSelectionPhase = false;
-                isMatchLive = false;
-                isPractice = false;
-                isDryRun = false;
-                StartWarmup();
-                SetMapSides();
-            });
         }
 
         private void ChangeMap(string mapName, float delay)
